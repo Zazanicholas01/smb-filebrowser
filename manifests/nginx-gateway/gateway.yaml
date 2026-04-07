@@ -9,6 +9,20 @@ spec:
     - name: http
       protocol: HTTP
       port: 80
+      hostname: files.home.nipo
+      allowedRoutes:
+        namespaces:
+          from: Same
+    
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: files.home.nipo
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: filebrowser-tls
       allowedRoutes:
         namespaces:
           from: Same
@@ -21,7 +35,9 @@ metadata:
 spec:
   parentRefs:
     - name: filebrowser-gateway
-      sectionName: http
+      sectionName: https
+  hostnames:
+    - files.home.nipo
   rules:
     - matches:
         - path:
