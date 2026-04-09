@@ -693,5 +693,12 @@ Add to `hosts` Windows file:
 127.0.0.1  home.home.nipo
 ```
 
+#### ***Keycloak OIDC Authentication***
+
+Target design:
+- Homepage behind oauth2-proxy + Keycloak
+- File Browser behind oauth2-proxy + Keycloak
+- Shared auth cookie domain `.home.nipo`
+
 #### ***Wireguard VPN Setup***
 
