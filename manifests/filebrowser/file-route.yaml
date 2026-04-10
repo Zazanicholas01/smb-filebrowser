@@ -12,6 +12,24 @@ spec:
   rules:
     - matches:
         - path:
+            type: Exact
+            value: /logout
+      backendRefs:
+        - name: logout-helper
+          namespace: auth
+          port: 8080
+          
+    - matches:
+        - path:
+            type: Exact
+            value: /logged-out
+      backendRefs:
+        - name: logout-helper
+          namespace: auth
+          port: 8080
+
+    - matches:
+        - path:
             type: PathPrefix
             value: /
       backendRefs:

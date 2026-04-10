@@ -700,5 +700,699 @@ Target design:
 - File Browser behind oauth2-proxy + Keycloak
 - Shared auth cookie domain `.home.nipo`
 
+Install Keycloak operator:
+```bash
+kubectl apply -f https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/26.6.0/kubernetes/keycloaks.k8s.keycloak.org-v1.yml
+kubectl apply -f https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/26.6.0/kubernetes/keycloakrealmimports.k8s.keycloak.org-v1.yml
+kubectl create namespace keycloak
+kubectl -n keycloak apply -f https://raw.githubusercontent.com/keycloak/keycloak-k8s-resources/26.6.0/kubernetes/kubernetes.yml
+```
+NAMESPACE - POSTGRES SECRET
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keycloak
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-db-secret
+  namespace: keycloak
+type: Opaque
+stringData:
+  username: keycloak
+  password: REPLACE_WITH_STRONG_DB_PASSWORD
+```
+POSTGRES
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: keycloak
+spec:
+  selector:
+    app: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: keycloak
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: keycloak
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-secret
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 8Gi
+```
+KEYCLOAK
+```yaml
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: Keycloak
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  instances: 1
+  db:
+    vendor: postgres
+    host: postgres
+    usernameSecret:
+      name: keycloak-db-secret
+      key: username
+    passwordSecret:
+      name: keycloak-db-secret
+      key: password
+  http:
+    httpEnabled: true
+  ingress:
+    enabled: false
+  hostname:
+    hostname: keycloak.home.nipo
+  proxy:
+    headers: xforwarded
+```
+FILEBROWSER CLIENT SECRET
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: filebrowser-oidc-client
+  namespace: keycloak
+type: Opaque
+stringData:
+  client-secret: REPLACE_WITH_SAME_SECRET_USED_BY_OAUTH2_PROXY
+```
+REALM IMPORT
+```yaml
+apiVersion: k8s.keycloak.org/v2alpha1
+kind: KeycloakRealmImport
+metadata:
+  name: home-realm
+  namespace: keycloak
+spec:
+  keycloakCRName: Keycloak
+  placeholders:
+    FILEBROWSER_CLIENT_SECRET:
+      secret:
+        name: filebrowser-oidc-client
+        key: client-secret
+  realm:
+    realm: home
+    enabled: true
+    registrationAllowed: false
+    loginWithEmailAllowed: true
+    duplicateEmailsAllowed: false
+    resetPasswordAllowed: true
+    rememberMe: true
+    clients:
+      - clientId: filebrowser
+        name: filebrowser
+        enabled: true
+        protocol: openid-connect
+        publicClient: false
+        secret: "${FILEBROWSER_CLIENT_SECRET}"
+        standardFlowEnabled: true
+        implicitFlowEnabled: false
+        directAccessGrantsEnabled: false
+        serviceAccountsEnabled: false
+        redirectUris:
+          - "https://files.home.nipo/oauth2/callback"
+        webOrigins:
+          - "https://files.home.nipo"
+```
+KEYCLOAK ROUTE
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: keycloak-route
+  namespace: keycloak
+spec:
+  parentRefs:
+    - name: filebrowser-gateway
+      namespace: filebrowser
+      sectionName: keycloak-https
+  hostnames:
+    - keycloak.home.nipo
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: keycloak-service
+          port: 8080
+```
+ADD ROUTE IN `gateway.yaml`
+```yaml
+    - name: keycloak-http
+      protocol: HTTP
+      port: 80
+      hostname: keycloak.home.nipo
+      allowedRoutes:
+        namespaces:
+          from: All
+    - name: keycloak-https
+      protocol: HTTPS
+      port: 443
+      hostname: keycloak.home.nipo
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: keycloak-tls
+      allowedRoutes:
+        namespaces:
+          from: All
+```
+
+Create secrets to change placeholders
+---
+**TLS certificates for keycloak domain**
+```bash
+openssl req -x509 -nodes -days 365 \
+  -newkey rsa:2048 \
+  -keyout keycloak.home.nipo.key \
+  -out keycloak.home.nipo.crt \
+  -subj "/CN=keycloak.home.nipo" \
+  -addext "subjectAltName=DNS:keycloak.home.nipo"
+```
+Create Kubernetes TLS Secret
+```bash
+k3s kubectl -n filebrowser delete secret keycloak-tls --ignore-not-found
+k3s kubectl -n filebrowser create secret tls keycloak-tls \
+  --cert=keycloak.home.nipo.crt \
+  --key=keycloak.home.nipo.key
+```
+---
+**Fill in Postgres and Filebrowser Client secrets**
+- Postgres -> Strong password, simple string
+- Filebrowser client -> `openssl rand -base64 32`
+---
+**Get Bootstrap Admin Credentials**
+```bash
+k3s kubectl -n keycloak get secret keycloak-initial-admin -o jsonpath='{.data.username}' | base64 -d
+echo
+k3s kubectl -n keycloak get secret keycloak-initial-admin -o jsonpath='{.data.password}' | base64 -d
+echo
+```
+Login at: `https://keycloak.home.nipo`
+
+---
+**Create a test user in Keycloak**
+- Go to **Users**
+- Create a user
+- Set email / username
+- Set a password
+- Disable temporary-password for easier access
+---
+
+**Deploy OAuth Proxy**
+
+Important settings:
+- Issuer URL -> `https://keycloak.home.nipo/realms/home`
+- Client ID -> `filebrowser`
+- Client secret -> Sane as filebrowser-client-secret
+- Redirect URL -> `https://files.home.nipo/oauth2/callback`
+
+NAMESPACE - SECRET
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auth
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oauth2-proxy-secret
+  namespace: auth
+type: Opaque
+stringData:
+  client-id: "filebrowser"
+  client-secret: <base64 rand secret>
+  cookie-secret: <base64 rand secret>
+```
+DEPLOYMENT
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy-filebrowser
+  namespace: auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy-filebrowser
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy-filebrowser
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.6.0
+          ports:
+            - containerPort: 4180
+          env:
+            - name: OAUTH2_PROXY_PROVIDER
+              value: oidc
+            - name: OAUTH2_PROXY_SKIP_OIDC_DISCOVERY
+              value: "true"
+            - name: OAUTH2_PROXY_OIDC_ISSUER_URL
+              value: https://keycloak.home.nipo/realms/home
+            - name: OAUTH2_PROXY_LOGIN_URL
+              value: https://keycloak.home.nipo/realms/home/protocol/openid-connect/auth
+            - name: OAUTH2_PROXY_REDEEM_URL
+              value: http://keycloak-service.keycloak.svc.cluster.local:8080/realms/home/protocol/openid-connect/token
+            - name: OAUTH2_PROXY_OIDC_JWKS_URL
+              value: http://keycloak-service.keycloak.svc.cluster.local:8080/realms/home/protocol/openid-connect/certs
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secret
+                  key: client-id
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secret
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secret
+                  key: cookie-secret
+            - name: OAUTH2_PROXY_COOKIE_SECURE
+              value: "true"
+            - name: OAUTH2_PROXY_COOKIE_DOMAINS
+              value: ".home.nipo"
+            - name: OAUTH2_PROXY_WHITELIST_DOMAINS
+              value: ".home.nipo"
+            - name: OAUTH2_PROXY_EMAIL_DOMAINS
+              value: "*"
+            - name: OAUTH2_PROXY_HTTP_ADDRESS
+              value: "0.0.0.0:4180"
+            - name: OAUTH2_PROXY_UPSTREAMS
+              value: "http://filebrowser.filebrowser.svc.cluster.local:80"
+            - name: OAUTH2_PROXY_REDIRECT_URL
+              value: "https://files.home.nipo/oauth2/callback"
+            - name: OAUTH2_PROXY_SCOPE
+              value: "openid email profile"
+            - name: OAUTH2_PROXY_REVERSE_PROXY
+              value: "true"
+            - name: OAUTH2_PROXY_SET_XAUTHREQUEST
+              value: "true"
+            - name: OAUTH2_PROXY_PASS_ACCESS_TOKEN
+              value: "true"
+            - name: OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER
+              value: "true"
+            - name: OAUTH2_PROXY_SET_AUTHORIZATION_HEADER
+              value: "true"
+            - name: OAUTH2_PROXY_SKIP_PROVIDER_BUTTON
+              value: "true"
+            - name: OAUTH2_PROXY_PASS_USER_HEADERS
+              value: "true"
+            - name: OAUTH2_PROXY_PREFER_EMAIL_TO_USER
+              value: "false"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy-filebrowser
+  namespace: auth
+spec:
+  selector:
+    app: oauth2-proxy-filebrowser
+  ports:
+    - name: http
+      port: 4180
+      targetPort: 4180
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-filebrowser-route-to-oauth2-proxy
+  namespace: auth
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: filebrowser
+  to:
+    - group: ""
+      kind: Service
+      name: oauth2-proxy-filebrowser
+```
+
+**Double network flow problem**
+
+OAuth2-Proxy tries to reach `keycloak.home.nipo` on `127.0.0.1:443`. From the pod, that address is itself, not the Gateway, so the connection is refused.
+
+- Browser-side host mapping for `keycloak.home.nipo` is pointing to `127.0.0.1`
+- That doesn't work for in-cluster pods
+- `Oauth2-Proxy` must resolve `keycloak.home.nipo` to an address reachable from the cluster
+
+In a real setup with a real Linux VM, it could be resolved just by pointing hosts to the Gateway Load Balancer IP. Since in WSL with Windows Proxy that isn't the case.
+
+There are 2 different network paths:
+- Browser path: `Browser` -> `Windows host proxy` -> `WSL NodePort`
+- Pod path: `Oauth2-proxy pod` -> `CoreDNS inside cluster`
+
+For the setup, the clean resolution is to use:
+- Public URL for the browser facing auth endpoint
+- Internal service URL for token calls
+
+Update Filebrowser HTTP route:
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: filebrowser-route
+  namespace: filebrowser
+spec:
+  parentRefs:
+    - name: filebrowser-gateway
+      sectionName: files-https
+  hostnames:
+    - files.home.nipo
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: oauth2-proxy-filebrowser
+          namespace: auth
+          port: 4180
+```
+If - 500 Internal Server Error with email not verified:
+- Go to Keycloak
+- Open realm home
+- Go to Users
+- Open the test user
+- In the user details, set Email Verified to On
+- Save
+- Try login again
+
+Or in alternative, allow unverified emails by adding this env variable:
+```yaml
+- name: OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL
+  value: "true"
+```
+**Forward Identity from Keycloak to Filebrowser**
+
+To use the identity from Keycloak to access also Filebrowser, we need to configure also Filebrowser authentication proxy.
+
+Update filebrowser deployment like this:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: filebrowser
+  namespace: filebrowser
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: filebrowser
+  template:
+    metadata:
+      labels:
+        app: filebrowser
+    spec:
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+        - name: configure-filebrowser-auth
+          image: filebrowser/filebrowser
+          command:
+            - sh
+            - -c
+            - >
+              filebrowser config set
+              -d /database/filebrowser.db
+              --auth.method=proxy
+              --auth.header=X-Forwarded-Preferred-Username
+          volumeMounts:
+            - name: data
+              mountPath: /database
+              subPath: database
+            - name: data
+              mountPath: /config
+              subPath: config
+
+        - name: ensure-proxy-user
+          image: filebrowser/filebrowser
+          command:
+            - sh
+            - -c
+            - >
+              filebrowser users find nipo-test -d /database/filebrowser.db ||
+              filebrowser users add nipo-test temp-pass-123 -d /database/filebrowser.db;
+              filebrowser users update nipo-test --lockPassword --perm.admin -d /database/filebrowser.db
+          volumeMounts:
+            - name: data
+              mountPath: /database
+              subPath: database
+            - name: data
+              mountPath: /config
+              subPath: config
+
+      containers:
+        - name: filebrowser
+          image: filebrowser/filebrowser
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: data
+              mountPath: /srv
+              subPath: srv
+            - name: data
+              mountPath: /database
+              subPath: database
+            - name: data
+              mountPath: /config
+              subPath: config
+
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: filebrowser-pvc
+```
+And also allow user header forwarding on the oauth2 proxy:
+```yaml
+            - name: OAUTH2_PROXY_PASS_USER_HEADERS
+              value: "true"
+            - name: OAUTH2_PROXY_PREFER_EMAIL_TO_USER
+              value: "false"
+```
+
+This allows identity headers to pass through on Filebrowser, but the username should exist already on Filebrowser and match exactly the one used.
+
+To allow also logout, wire these manifests:
+
+Update File route by adding these 2 rules:
+```yaml
+    - matches:
+        - path:
+            type: Exact
+            value: /logout
+      backendRefs:
+        - name: logout-helper
+          namespace: auth
+          port: 8080
+          
+    - matches:
+        - path:
+            type: Exact
+            value: /logged-out
+      backendRefs:
+        - name: logout-helper
+          namespace: auth
+          port: 8080
+```
+
+Add Logout Helper manifest:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logout-helper-content
+  namespace: auth
+data:
+  logout.html: |
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Signing out</title>
+    </head>
+    <body>
+      <p>Signing out...</p>
+      <script>
+        const keycloakLogout =
+          "https://keycloak.home.nipo/realms/home/protocol/openid-connect/logout" +
+          "?id_token_hint={id_token}" +
+          "&client_id=filebrowser" +
+          "&post_logout_redirect_uri=https%3A%2F%2Ffiles.home.nipo%2Flogged-out";
+
+        const target =
+          "/oauth2/sign_out?rd=" + encodeURIComponent(keycloakLogout);
+
+        window.location.replace(target);
+      </script>
+    </body>
+    </html>
+  logged-out.html: |
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Logged out</title>
+    </head>
+    <body>
+      <h1>Logged out</h1>
+      <p>Your File Browser and Keycloak sessions have been ended.</p>
+      <p><a href="/">Sign in again</a></p>
+    </body>
+    </html>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logout-helper-nginx
+  namespace: auth
+data:
+  default.conf: |
+    server {
+      listen 8080;
+      server_name _;
+      root /usr/share/nginx/html;
+      index logout.html;
+
+      location = /logout {
+        try_files /logout.html =404;
+      }
+
+      location = /logged-out {
+        try_files /logged-out.html =404;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: logout-helper
+  namespace: auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: logout-helper
+  template:
+    metadata:
+      labels:
+        app: logout-helper
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d
+            - name: html-content
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: logout-helper-nginx
+        - name: html-content
+          configMap:
+            name: logout-helper-content
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: logout-helper
+  namespace: auth
+spec:
+  selector:
+    app: logout-helper
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-filebrowser-route-to-logout-helper
+  namespace: auth
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: filebrowser
+  to:
+    - group: ""
+      kind: Service
+      name: logout-helper
+```
+
 #### ***Wireguard VPN Setup***
 
